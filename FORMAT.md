@@ -90,14 +90,12 @@ Example updated metadata.json:
 }
 ```
 
-## Directory structure (how you submit)
+## Directory structure
 
 ```
-my_contributions/
+my_recordings/
 ├── coffee_esp32-mq3_2026-06-15.csv
 ├── coffee_esp32-mq3_2026-06-15.json
 ├── vanilla_esp32-mq3_2026-06-15.csv
 └── vanilla_esp32-mq3_2026-06-15.json
 ```
-
-Drop this folder into the upload notebook — done.
