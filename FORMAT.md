@@ -15,7 +15,10 @@ Every contributed recording consists of **one CSV file** and **one metadata JSON
 | `timestamp` | float (seconds) | Optional. Time since recording start. |
 | `sensor_1` through `sensor_N` | float | Sensor readings. N can be any number ≥ 1. |
 
-Column names can be descriptive (e.g., `sensor_NO2`, `sensor_alcohol`) or generic (`sensor_1`). The upload tool auto-detects sensor columns by checking for the `sensor_` prefix.
+Column names can be descriptive (e.g., `sensor_NO2`, `sensor_alcohol`) or generic (`sensor_1`). The upload tool auto-detects sensor columns by checking for one of three accepted prefixes (matching the data-commons Rust crate):
+- `sensor_` — e.g., `sensor_1`, `sensor_NO2`
+- `MQ` — e.g., `MQ-135`, `MQ3`
+- `ch` — e.g., `ch0`, `ch1` (generic channel-numbered columns)
 
 ### Rules
 

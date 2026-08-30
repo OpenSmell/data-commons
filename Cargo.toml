@@ -1,0 +1,16 @@
+[package]
+name = "data-commons"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenSmell Data Commons: submission, verification, and approval pipeline"
+
+[dependencies]
+opensmell = { path = "../opensmell-rs" }
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+log.workspace = true
+sha2 = "0.10"
