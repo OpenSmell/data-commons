@@ -79,6 +79,57 @@ $R_0$: every temporal feature divides a sample count by this number, so an
 omitted rate rescales rise time, decay time, latency, and hysteresis by the same
 factor.
 
+### Optional: phase events
+
+Add an `events` list to the metadata JSON to label phases within a recording.
+This matters for anything measured during a change rather than at a steady
+state — exposures, air gaps, recovery — because a consumer who has to infer the
+phase boundaries from the response is inferring them from the thing being
+measured.
+
+```json
+{
+  "events": [
+    {"label": "baseline",    "start_ms": 0,      "end_ms": 300000},
+    {"label": "exposure_a",  "start_ms": 300000, "end_ms": 360000},
+    {"label": "gap",         "start_ms": 360000, "end_ms": 960000},
+    {"label": "exposure_b",  "start_ms": 960000, "end_ms": 1020000},
+    {"label": "recovery",    "start_ms": 1020000}
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `label` | string | Phase name. Free-form; the validator only warns about unconventional names. |
+| `start_ms` | number | Phase start, **milliseconds** from recording start. `start_s` is also accepted. |
+| `end_ms` | number | Optional phase end, same unit. Omit for the final phase. |
+
+Conventional labels are `baseline`, `exposure_a`, `exposure_b`, `gap`, and
+`recovery`. Any other label is accepted — an experiment may need one the
+validator has never seen — but non-standard labels are reported so a consumer can
+see the vocabulary is local to the contributor.
+
+Note the unit asymmetry: `timestamp` in the CSV is in **seconds**, while
+`start_ms`/`end_ms` are in **milliseconds**. This is a deliberate belt-and-braces
+choice rather than an oversight — the two sit next to each other, and a
+millisecond file is otherwise indistinguishable from a 1000× rate error, so a
+unit-tagged key is the only thing that makes the mix-up visible. `start_s` and
+`end_s` exist for contributors who prefer to match the CSV's units. The validator
+flags a ~1000× disagreement between the event span and the recording span in
+either direction.
+
+Events must not overlap, and an event must not end before it starts. The validator
+also reports whether event boundaries fall on a sample edge: at 2 Hz a boundary
+up to one 500 ms period off the grid is ordinary quantisation, and more than that
+means the boundary was estimated rather than observed. That distinction matters
+because an estimated transition time carries an error of the same order as the
+fast recovery mode (τ ≈ 8–25 s).
+
+The same structure is written as a standalone `events.json` inside `.osmell`
+bundles (`opensmell`, `SessionEvent`), so a bundle converted from an exchange
+submission keeps its phase labels.
+
 ### Sensor metadata (required in metadata JSON)
 
 For every sensor column, the metadata JSON must specify:
