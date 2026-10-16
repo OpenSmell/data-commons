@@ -39,15 +39,37 @@ MIN_PLAUSIBLE_DURATION_S = 1.0
 MAX_PLAUSIBLE_DURATION_S = 24 * 3600.0
 
 # Phase events. Labels are not enumerated: an arbitrary label is legitimate, so
-# these are advisory hints rather than a closed vocabulary. `exposure_a` /
+# these are advisory hints rather than a closed vocabulary. `baseline` /
+# `exposure` / `recovery` are the three labels the wire `EVENT` message uses for
+# the single-substance protocol (docs/wire-protocol.md); `exposure_a` /
 # `exposure_b` / `gap` are the labels used by the A->B transition protocol
 # (docs/transition-protocol-ab.md).
-KNOWN_PHASE_LABELS = {"baseline", "exposure_a", "exposure_b", "gap", "recovery"}
+KNOWN_PHASE_LABELS = {
+    "baseline", "exposure", "exposure_a", "exposure_b", "gap", "recovery",
+}
 
-# A boundary recorded between samples is unavoidably quantised. One sample period
-# of slack is normal; anything beyond that means the event time was estimated
-# rather than observed, which is worth surfacing.
-MAX_BOUNDARY_SLACK_PERIODS = 1.0
+# A boundary recorded between samples is unavoidably quantised, so a boundary a
+# little off the grid is not evidence of anything. The slack is measured as the
+# distance from a boundary to the *nearest* sample edge, and that distance can
+# never exceed half a period -- so a threshold of half a period or more makes the
+# off-grid report unreachable and silently declares every boundary aligned. A
+# quarter of a period is the reachable bound that still admits a boundary snapped
+# from a clock running at twice the sample rate, while flagging one that was
+# estimated from something else entirely.
+MAX_BOUNDARY_SLACK_PERIODS = 0.25
+
+# Unit cross-check between the event span and the recording span. The CSV
+# `timestamp` column is in seconds by spec and the event keys say ms, so the two
+# spans differ by this factor whenever one of them has been authored in the wrong
+# unit. Both directions are rejected: a boundary that is out by 1000x puts the
+# whole phase structure at the wrong point on the timebase, and every
+# count-based temporal feature then scales by that same factor with no other
+# symptom. The window is tight around the factor on purpose — a recording that
+# genuinely labels only part of a long drift log is partial coverage, which is
+# reported as information rather than rejected.
+UNIT_MISMATCH_FACTOR = 1000.0
+UNIT_MISMATCH_MIN_RATIO = UNIT_MISMATCH_FACTOR / 2.0    # 500
+UNIT_MISMATCH_MAX_RATIO = UNIT_MISMATCH_FACTOR * 2.0    # 2000
 
 
 def validate_csv(filepath: Path) -> Tuple[bool, List[str], List[str]]:
@@ -173,6 +195,8 @@ def _check_events(
     them from the thing being measured. Events are therefore optional here, but
     present-and-broken is an error, because a mislabelled phase is worse than an
     absent one -- it produces confident wrong answers rather than an obvious gap.
+    A ~1000x disagreement between the event span and the recording span is that
+    case in either direction, and both are errors.
 
     Returns (errors, infos).
     """
@@ -252,6 +276,12 @@ def _check_events(
         standard = "" if unknown else ", all with standard labels"
         infos.append(f"{len(labels)} phase event{plural}{standard}")
 
+    if not boundaries:
+        # Every event was malformed. The errors above already say why, and none of
+        # the checks below have a boundary to look at -- max() on an empty sequence
+        # would raise and take the whole run down with it.
+        return errors, infos
+
     last_ms = max(b[1] for b in boundaries)
 
     if duration_s is None:
@@ -262,14 +292,28 @@ def _check_events(
         return errors, infos
 
     # Unit cross-check. The CSV timestamp column is in seconds by spec; the event
-    # keys say ms. A 1000x discrepancy in either direction means one of the two was
-    # authored in the wrong unit, and the recording is then unusable for kinetics.
+    # keys say ms, so a mix-up between the two shows up as a span disagreement of
+    # ~1000x in one direction or the other. Either way the recording is unusable
+    # for kinetics, so both are rejected -- this used to report only the overshoot
+    # direction, which let the mirror-image mistake through as an info line.
     ratio = (last_ms / 1000.0) / duration_s
-    if 500.0 < ratio < 2000.0:
+    unit_mismatch = False
+    if UNIT_MISMATCH_MIN_RATIO <= ratio <= UNIT_MISMATCH_MAX_RATIO:
+        unit_mismatch = True
         errors.append(
             f"phase events run to {last_ms / 1000:g}s but the recording is only "
             f"{duration_s:g}s ({ratio:.4g}x). One of the two is in the wrong time unit "
             f"-- the timestamp column must be seconds and events must be ms."
+        )
+    elif 1.0 / UNIT_MISMATCH_MAX_RATIO <= ratio <= 1.0 / UNIT_MISMATCH_MIN_RATIO:
+        unit_mismatch = True
+        errors.append(
+            f"phase events run to {last_ms / 1000:g}s but the recording is "
+            f"{duration_s:g}s ({ratio:.4g}x), i.e. ~{UNIT_MISMATCH_FACTOR:g}x too "
+            f"short. One of the two is in the wrong time unit -- the timestamp column "
+            f"must be seconds and events must be ms. Event values that are really "
+            f"seconds were written under 'start_ms'/'end_ms' keys: multiply them by "
+            f"{UNIT_MISMATCH_FACTOR:g}, or rename the keys to start_s/end_s."
         )
     elif last_ms > duration_s * 1000.0 + 1.0:
         errors.append(
@@ -280,23 +324,14 @@ def _check_events(
         infos.append(f"phase events fit within the {duration_s:g}s recording")
 
     unlabelled_s = duration_s - last_ms / 1000.0
-    if unlabelled_s > 0:
-        if ratio < 0.01:
-            # Not an error: labelling one stimulus window inside a long drift
-            # recording is legitimate. But 1/1000 is exactly the factor between the
-            # _ms keys and seconds, so name the likely cause rather than leaving a
-            # contributor to wonder why their phases look tiny.
-            infos.append(
-                f"phase events cover only {last_ms / 1000:g}s of a {duration_s:g}s "
-                f"recording. If these events are meant to span the recording, the "
-                f"values look like seconds written under 'start_ms'/'end_ms' keys: "
-                f"multiply them by 1000, or rename the keys to start_s/end_s."
-            )
-        else:
-            infos.append(
-                f"last {unlabelled_s:.4g}s of the recording carries no phase label; "
-                f"label it 'recovery' or leave the last event open-ended"
-            )
+    if unlabelled_s > 0 and not unit_mismatch:
+        # Not an error: labelling one stimulus window inside a long drift recording
+        # is legitimate, and the tail after the last boundary is the open-ended
+        # final phase.
+        infos.append(
+            f"last {unlabelled_s:.4g}s of the recording carries no phase label; "
+            f"label it 'recovery' or leave the last event open-ended"
+        )
 
     rate = _implied_rate(csv_infos)
     if rate and rate > 0:
@@ -309,8 +344,9 @@ def _check_events(
         ]
         if off_grid:
             infos.append(
-                f"event boundaries not on a sample edge (more than one {period_ms:.4g}ms "
-                f"period off): {', '.join(sorted(set(off_grid)))}; boundaries appear "
+                f"event boundaries not on a sample edge (more than "
+                f"{MAX_BOUNDARY_SLACK_PERIODS:g} of a {period_ms:.4g}ms period from the "
+                f"nearest edge): {', '.join(sorted(set(off_grid)))}; boundaries appear "
                 f"estimated rather than observed"
             )
         else:

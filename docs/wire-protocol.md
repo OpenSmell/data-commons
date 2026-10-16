@@ -7,7 +7,7 @@ Communication protocol between OpenSmell devices and host software.
 
 ## Overview
 
-The OpenSmell Serial Message (OSM) protocol is a lightweight, line-based protocol for transmitting sensor data, device metadata, calibration events, and errors over serial (USB) or TCP connections.
+The OpenSmell Serial Message (OSM) protocol is a lightweight, line-based protocol for transmitting sensor data, device metadata, calibration events, phase events, and errors over serial (USB) or TCP connections.
 
 ## Physical Layer
 
@@ -106,6 +106,78 @@ CAL,0,1024.50
 CAL,1,2048.30
 ```
 
+### Phase event — `EVENT`
+
+Marks a phase boundary in the stream. The host tells the device that the sample
+about to be emitted is the first of a new phase, and the device re-emits the
+boundary on every output, so any reader of the stream — not only the host that
+injected it — can place the boundary against a specific sample.
+
+**Direction.** Host → device to inject. Device → USB serial *and* every
+connected TCP client to announce. This is the only message in the protocol that
+a host sends to change the meaning of the data that follows it.
+
+```
+EVENT,<label>,<sample_index>[,t_ms=<MS>]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `label` | string | Phase name. Conventional: `baseline`, `exposure`, `recovery`. No commas or whitespace. |
+| `sample_index` | integer | Index of the **first sample of the new phase**, counted from the device's first sample after boot (0-based). `-1` asks the device to substitute its own next-sample index. |
+| `t_ms` | integer | **Optional.** Host monotonic clock at injection, in milliseconds. Lets a passive reader recover the host-clock boundary time without having sent the message. |
+
+**Example:**
+```
+EVENT,exposure,600
+EVENT,recovery,720,t_ms=361200
+```
+
+**Semantics:**
+
+- The device resolves `sample_index` (`-1` → its own counter), then emits the
+  `EVENT` line exactly once, immediately **before** the first `OSM` line of the
+  new phase, on USB serial and to every connected TCP client. A linear reader
+  therefore knows that the next `OSM` line is sample `<sample_index>` without
+  counting anything.
+- A `t_ms` supplied by the injecting host is echoed unchanged, so a passive
+  reader on another transport can place the boundary on the same host timeline.
+  Without one, the device emits the two-field form `EVENT,<label>,<sample_index>`.
+- The device holds one pending boundary. A second `EVENT` arriving before the next
+  sampling tick replaces the first, since the replaced phase never produced a
+  sample and so never existed on the wire. A host that needs two boundaries closer
+  together than one sample period has to wait for the echo before sending the
+  next one.
+- The boundary applies from that sample onward until the next `EVENT`. There is
+  no `end` field: a phase runs until the next boundary or the end of the stream.
+- Resending the same `label` at the same index is idempotent from a reader's
+  point of view — the duplicate line carries the same annotation.
+- A malformed `EVENT` (no label, non-numeric index, label containing a comma) is
+  rejected with `ERR,8,<message>` and the stream continues unchanged.
+
+`label` is not a closed vocabulary. `baseline` / `exposure` / `recovery` are the
+three phases of the single-substance recording protocol; the A→B transition
+protocol adds `exposure_a`, `gap`, `exposure_b` (see
+`e-nose-evals/docs/transition-protocol-ab.md`). An unrecognised label is a legal
+phase name.
+
+**Why a sample index and not a timestamp.** The device does not know when the
+operator opened the bottle, and the host clock is not the device clock. Only the
+sample counter is common to both, and a sample index converts to a time exactly
+once — via `INFO,<...>,interval_ms=<MS>`. That is the same reason `OSM` carries
+no timestamp of its own.
+
+**Backward compatibility.** `EVENT` is a new message type, so a reader built
+against an earlier revision meets it as an unknown line and must skip it and
+carry on (`OsmMessage::Unknown`; "Parse errors: Skip line, log warning,
+continue"). Folding the boundary into the `OSM` line instead would change the
+meaning of a message every existing reader already parses. No existing message
+changes shape, so a stream containing `EVENT` stays readable by an old host; the
+old host simply records no phase labels. Following this protocol's versioning
+rule, support is advertised the same way as everything else — in the semver
+`firmware_version` on `INFO` — and a host must treat its absence as normal
+rather than as an error.
+
 ### Error — `ERR`
 
 Transmitted on hardware or software errors.
@@ -130,6 +202,7 @@ ERR,<code>,<message>
 | 5 | WiFi connection lost |
 | 6 | Fan failure |
 | 7 | Temperature/humidity sensor failure |
+| 8 | Malformed or unsupported host command |
 
 **Example:**
 ```
@@ -159,6 +232,7 @@ PONG,<host_timestamp>
 | Data transmission | Declared via `INFO` (`interval_ms`), nominally 500 ms / 2 Hz | Continuous after connection |
 | Ping | 5s | Device-initiated |
 | Calibration | On event | 30 min baseline at startup |
+| Phase event | On event | Host-injected; announced on every output |
 | Error | On event | Immediate |
 
 ## Connection Sequence
@@ -173,7 +247,16 @@ PONG,<host_timestamp>
 6. After baseline: OSM messages at the declared interval
 7. Host sends PING every 5s
 8. Device responds with INFO on PING
+9. At any point after step 2, the host may inject EVENT to mark a phase
+   boundary; the device announces it on every output before the first sample of
+   the new phase
 ```
+
+`INFO` is sent to **every** newly connected transport, not only to whichever one
+the host happened to open first: a client that connects after the stream is
+already running has no other way to learn the declared cadence, and a client that
+guesses it rescales every count-based temporal feature by the ratio of the
+guessed and true rates.
 
 ## Calibration Sequence
 
@@ -195,6 +278,25 @@ PONG,<host_timestamp>
 4. Device logs: INFO,Cartridge swap channel <ch> <old> -> <new>
 ```
 
+## Phase Event Sequence
+
+```
+1. Host is recording and reaches a phase boundary
+2. Host sends: EVENT,<label>,-1        (-1 = device assigns the next sample index)
+3. Device holds the boundary until the next sampling tick
+4. Device emits EVENT,<label>,<sample_index> on serial and to every TCP client
+5. Device emits the OSM line for <sample_index> immediately after
+6. The phase runs until the next EVENT; the host records start_ms from the
+   annotated sample's timestamp
+```
+
+Step 6 is why the boundary is announced rather than applied silently: the host
+learns the boundary at the same sample the device does, so a recorded phase
+boundary needs no host-side interpolation afterwards. A boundary lands at most
+one sample period (±500 ms at 2 Hz) from the physical event — small against a
+fast mode of τ ≈ 8–25 s, but not zero. See
+`e-nose-evals/docs/transition-protocol-ab.md` §2.
+
 ## Arduino Firmware
 
 The `generate_arduino_sketch()` function produces a complete `.ino` file:
@@ -215,6 +317,8 @@ let sketch = generate_arduino_sketch(
 - 30-second baseline collection (configurable)
 - OSM protocol output
 - PING/PONG heartbeat
+- `INFO` with `interval_ms` on every client connect, not only at boot
+- `EVENT` injection and re-announcement on every output
 - Error handling (ERR messages)
 - EEPROM persistence for calibration data
 
@@ -229,6 +333,22 @@ let sketch = generate_arduino_sketch(
 5. Extract features
 6. Detect anomalies
 
+### Phase events
+
+Not needed for steady-state work, and required for anything that measures during a
+change:
+
+1. Send `EVENT,<label>,-1` at each phase boundary
+2. Handle the `EVENT` echo, and record `start_ms` from the timestamp of the
+   sample whose `sample_index` it carries — not from when the line arrived
+3. Write the boundaries out as `events` (`data-commons/FORMAT.md` §"Optional:
+   phase events"), or as `events.json` inside a `.osmell` bundle
+
+A host that annotates boundaries after the fact, from its own clock, reintroduces
+the estimated-boundary error the wire message exists to remove: a boundary
+guessed to the nearest second carries up to a full second of error, against a
+fast recovery mode that completes in 8–25 s.
+
 ### Production
 
 1. All minimum requirements
@@ -242,7 +362,7 @@ let sketch = generate_arduino_sketch(
 ## Parser Implementation
 
 ```rust
-use opensmell::{OsmProtocol, OsmMessage};
+use opensmell::{format_event, OsmProtocol, OsmMessage};
 
 let protocol = OsmProtocol::new(expected_channels=6);
 
@@ -261,6 +381,11 @@ match protocol.parse_line(line, timestamp)? {
     OsmMessage::Calibration { channel, r0_value } => {
         // Update baseline for channel
     }
+    OsmMessage::Event { label, sample_index, t_ms } => {
+        // Phase boundary: the next OSM line is sample `sample_index`
+        assert_eq!(label, "exposure");
+        assert_eq!(sample_index, 600);
+    }
     OsmMessage::Error { code, message } => {
         // Handle error, alert user
     }
@@ -271,11 +396,18 @@ match protocol.parse_line(line, timestamp)? {
         // Log and skip
     }
 }
+
+// Mark a phase boundary: -1 asks the device for its own next-sample index.
+// Write the returned line with a trailing '\n'.
+let line = format_event("exposure", -1, None);
+assert_eq!(line, "EVENT,exposure,-1");
 ```
 
 ## Error Handling
 
 - **Parse errors:** Skip line, log warning, continue
+- **Unknown message type:** Skip line, log warning, continue — this is what keeps
+  a stream containing `EVENT` readable by a host built before `EVENT` existed
 - **Channel mismatch:** Auto-pad with 0.0 or truncate to expected count
 - **Timeout:** No data for 10s → warning; 30s → reconnect
 - **CRC errors:** Not implemented (TCP provides integrity)

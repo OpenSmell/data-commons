@@ -105,26 +105,35 @@ measured.
 | `start_ms` | number | Phase start, **milliseconds** from recording start. `start_s` is also accepted. |
 | `end_ms` | number | Optional phase end, same unit. Omit for the final phase. |
 
-Conventional labels are `baseline`, `exposure_a`, `exposure_b`, `gap`, and
-`recovery`. Any other label is accepted — an experiment may need one the
-validator has never seen — but non-standard labels are reported so a consumer can
-see the vocabulary is local to the contributor.
+Conventional labels are `baseline`, `exposure`, `exposure_a`, `exposure_b`,
+`gap`, and `recovery`. `baseline` / `exposure` / `recovery` are the three labels the wire
+`EVENT` message uses for the single-substance protocol
+(`docs/wire-protocol.md`); `exposure_a` / `exposure_b` / `gap` are the ones the
+A→B transition protocol uses. Any other label is accepted — an experiment may
+need one the validator has never seen — but non-standard labels are reported so a
+consumer can see the vocabulary is local to the contributor.
 
 Note the unit asymmetry: `timestamp` in the CSV is in **seconds**, while
 `start_ms`/`end_ms` are in **milliseconds**. This is a deliberate belt-and-braces
 choice rather than an oversight — the two sit next to each other, and a
 millisecond file is otherwise indistinguishable from a 1000× rate error, so a
 unit-tagged key is the only thing that makes the mix-up visible. `start_s` and
-`end_s` exist for contributors who prefer to match the CSV's units. The validator
-flags a ~1000× disagreement between the event span and the recording span in
-either direction.
+`end_s` exist for contributors who prefer to match the CSV's units. **The
+validator rejects a ~1000× disagreement between the event span and the recording
+span in either direction**, because a boundary that is out by 1000× puts the
+phase structure at the wrong point on the timebase and every count-based
+temporal feature then scales by that same factor with no other symptom. Labelling
+only part of a long recording is *not* rejected — that is reported as
+unlabelled tail.
 
 Events must not overlap, and an event must not end before it starts. The validator
-also reports whether event boundaries fall on a sample edge: at 2 Hz a boundary
-up to one 500 ms period off the grid is ordinary quantisation, and more than that
-means the boundary was estimated rather than observed. That distinction matters
+also reports whether event boundaries fall on a sample edge: the distance from a
+boundary to the nearest sample edge is at most half a sample period, so the check
+fires on anything more than a quarter of a period (125 ms at 2 Hz) away from one.
+A boundary further out than that was estimated rather than observed, which matters
 because an estimated transition time carries an error of the same order as the
-fast recovery mode (τ ≈ 8–25 s).
+fast recovery mode (τ ≈ 8–25 s). A boundary recorded on the wire by an `EVENT`
+message is on a sample edge by construction.
 
 The same structure is written as a standalone `events.json` inside `.osmell`
 bundles (`opensmell`, `SessionEvent`), so a bundle converted from an exchange
